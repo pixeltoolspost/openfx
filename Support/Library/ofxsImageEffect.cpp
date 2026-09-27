@@ -14,6 +14,10 @@
 #include "ofxGPURender.h"
 #include "ofxsCore.h"
 
+// Guards the discovery registry only. It does not extend the host-controlled
+// lifetime of a returned OfxPlugin pointer past that plugin's unload action.
+static std::mutex gRegistryMutex;
+
 #if defined __APPLE__ || defined __linux__ || defined __FreeBSD__
 # if __GNUC__ >= 4
 #  define EXPORT __attribute__((visibility("default")))
@@ -2023,12 +2027,16 @@ namespace OFX {
         toBeDeleted.clear();
       }
       { 
+        std::lock_guard<std::mutex> lock(::gRegistryMutex);
         OFX::OfxPlugInfoMap::iterator it = OFX::plugInfoMap.find(id);
-        OFX::OfxPluginArray::iterator it2 = std::find(ofxPlugs.begin(), ofxPlugs.end(), it->second._plug.get());
-        if (it2 != ofxPlugs.end()) {
-          (*it2) = nullptr;
+        if (it != OFX::plugInfoMap.end()) {
+          OFX::OfxPluginArray::iterator it2 =
+              std::find(ofxPlugs.begin(), ofxPlugs.end(), it->second._plug.get());
+          if (it2 != ofxPlugs.end()) {
+            (*it2) = nullptr;
+          }
+          OFX::plugInfoMap.erase(it);
         }
-        OFX::plugInfoMap.erase(it);
       }
     }
 
@@ -2571,11 +2579,14 @@ namespace OFX {
       OfxStatus stat = kOfxStatReplyDefault;
       try {
 
-        OfxPlugInfoMap::iterator it = plugInfoMap.find(plugname);
-        if(it==plugInfoMap.end())
-          throw;
-
-        OFX::PluginFactory* factory = it->second._factory;
+        OFX::PluginFactory* factory = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(::gRegistryMutex);
+          OfxPlugInfoMap::iterator it = plugInfoMap.find(plugname);
+          if(it==plugInfoMap.end())
+            throw;
+          factory = it->second._factory;
+        }
 
         // Cast the raw handle to be an image effect handle, because that is what it is
         OfxImageEffectHandle handle = (OfxImageEffectHandle) handleRaw;
@@ -3030,12 +3041,11 @@ OFX::OfxPlugInfo generatePlugInfo(OFX::PluginFactory* factory, std::string& newI
 }
 
 bool gHasInit = false;
-static std::mutex gInitMutex;
 
 static
 void init()
 {
-  std::lock_guard<std::mutex> lock(gInitMutex);
+  std::lock_guard<std::mutex> lock(gRegistryMutex);
   if(gHasInit)
     return;
 
@@ -3078,13 +3088,15 @@ EXPORT int OfxGetNumberOfPlugins(void)
 /** @brief, mandated function returning the nth plugin 
 
 We call the plugin side defined OFX::Plugin::getPluginIDs function to find out what to set.
+The returned raw pointer remains valid only until the host dispatches that
+plugin's unload action; hosts must not retain or invoke it after unload.
 */
 
 EXPORT OfxPlugin* OfxGetPlugin(int nth)
 {
   try {
     init();
-    std::lock_guard<std::mutex> lock(gInitMutex);
+    std::lock_guard<std::mutex> lock(gRegistryMutex);
     int numPlugs = (int)OFX::plugInfoMap.size();
     if(nth < 0 || nth >= (int)OFX::ofxPlugs.size())
       return nullptr;
