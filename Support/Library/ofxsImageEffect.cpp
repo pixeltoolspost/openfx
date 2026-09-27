@@ -6,12 +6,17 @@
 #include "ofxsSupportPrivate.h"
 #include <algorithm> // for find
 #include <cstring> // for strlen
+#include <mutex>
 #ifdef DEBUG
 #include <iostream>
 #endif
 #include <stdexcept>
 #include "ofxGPURender.h"
 #include "ofxsCore.h"
+
+// Guards the discovery registry only. It does not extend the host-controlled
+// lifetime of a returned OfxPlugin pointer past that plugin's unload action.
+static std::mutex gRegistryMutex;
 
 #if defined __APPLE__ || defined __linux__ || defined __FreeBSD__
 # if __GNUC__ >= 4
@@ -2022,12 +2027,16 @@ namespace OFX {
         toBeDeleted.clear();
       }
       { 
+        std::lock_guard<std::mutex> lock(::gRegistryMutex);
         OFX::OfxPlugInfoMap::iterator it = OFX::plugInfoMap.find(id);
-        OFX::OfxPluginArray::iterator it2 = std::find(ofxPlugs.begin(), ofxPlugs.end(), it->second._plug.get());
-        if (it2 != ofxPlugs.end()) {
-          (*it2) = nullptr;
+        if (it != OFX::plugInfoMap.end()) {
+          OFX::OfxPluginArray::iterator it2 =
+              std::find(ofxPlugs.begin(), ofxPlugs.end(), it->second._plug.get());
+          if (it2 != ofxPlugs.end()) {
+            (*it2) = nullptr;
+          }
+          OFX::plugInfoMap.erase(it);
         }
-        OFX::plugInfoMap.erase(it);
       }
     }
 
@@ -2570,11 +2579,14 @@ namespace OFX {
       OfxStatus stat = kOfxStatReplyDefault;
       try {
 
-        OfxPlugInfoMap::iterator it = plugInfoMap.find(plugname);
-        if(it==plugInfoMap.end())
-          throw;
-
-        OFX::PluginFactory* factory = it->second._factory;
+        OFX::PluginFactory* factory = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(::gRegistryMutex);
+          OfxPlugInfoMap::iterator it = plugInfoMap.find(plugname);
+          if(it==plugInfoMap.end())
+            throw;
+          factory = it->second._factory;
+        }
 
         // Cast the raw handle to be an image effect handle, because that is what it is
         OfxImageEffectHandle handle = (OfxImageEffectHandle) handleRaw;
@@ -3033,47 +3045,72 @@ bool gHasInit = false;
 static
 void init()
 {
+  std::lock_guard<std::mutex> lock(gRegistryMutex);
   if(gHasInit)
     return;
 
-  OFX::Plugin::getPluginIDs(OFX::plugIDs);
-  if(OFX::ofxPlugs.empty())
-    OFX::ofxPlugs.resize(OFX::plugIDs.size());
+  // Build the discovery registry off to the side. OfxGetNumberOfPlugins and
+  // OfxGetPlugin are exported C entry points, so an allocation failure must
+  // neither escape into the host nor leave a partial registry behind for a
+  // later discovery attempt.
+  OFX::PluginFactoryArray newPlugIDs;
+  OFX::Plugin::getPluginIDs(newPlugIDs);
+  OFX::OfxPluginArray newOfxPlugs(newPlugIDs.size());
+  OFX::OfxPlugInfoMap newPlugInfoMap;
 
   int counter = 0;
-  for (OFX::PluginFactoryArray::const_iterator it = OFX::plugIDs.begin(); it != OFX::plugIDs.end(); ++it, ++counter)
+  for (OFX::PluginFactoryArray::const_iterator it = newPlugIDs.begin(); it != newPlugIDs.end(); ++it, ++counter)
   {
     std::string newID;
     OFX::OfxPlugInfo info = generatePlugInfo(*it, newID);
-    OFX::ofxPlugs[counter] = info._plug.get();
-    OFX::plugInfoMap[newID] = std::move(info);
+    newPlugInfoMap[newID] = std::move(info);
+    newOfxPlugs[counter] = newPlugInfoMap.find(newID)->second._plug.get();
   }
+
+  OFX::plugIDs.swap(newPlugIDs);
+  OFX::ofxPlugs.swap(newOfxPlugs);
+  OFX::plugInfoMap.swap(newPlugInfoMap);
   gHasInit = true;
 }
 
 /** @brief, mandated function returning the number of plugins, which is always 1 */
 EXPORT int OfxGetNumberOfPlugins(void)
 {
-  init();
-  return (int)OFX::plugIDs.size();
+  try {
+    init();
+    return (int)OFX::plugIDs.size();
+  }
+  catch (...) {
+    return 0;
+  }
 }
 
 /** @brief, mandated function returning the nth plugin 
 
 We call the plugin side defined OFX::Plugin::getPluginIDs function to find out what to set.
+The returned raw pointer remains valid only until the host dispatches that
+plugin's unload action; hosts must not retain or invoke it after unload.
 */
 
 EXPORT OfxPlugin* OfxGetPlugin(int nth)
 {
-  init();
-  int numPlugs = (int)OFX::plugInfoMap.size();
-  OFX::Log::error(nth >= numPlugs, "Host attempted to get plugin %d, when there is only %d plugin(s), so it should have asked for 0.", nth, numPlugs);
-  if(OFX::ofxPlugs[nth] == nullptr)
-  {
-    std::string newID;
-    OFX::OfxPlugInfo info = generatePlugInfo(OFX::plugIDs[nth], newID);
-    OFX::ofxPlugs[nth] = info._plug.get();
-    OFX::plugInfoMap[newID] = std::move(info);
+  try {
+    init();
+    std::lock_guard<std::mutex> lock(gRegistryMutex);
+    int numPlugs = (int)OFX::plugInfoMap.size();
+    if(nth < 0 || nth >= (int)OFX::ofxPlugs.size())
+      return nullptr;
+    OFX::Log::error(nth >= numPlugs, "Host attempted to get plugin %d, when there is only %d plugin(s), so it should have asked for 0.", nth, numPlugs);
+    if(OFX::ofxPlugs[nth] == nullptr)
+    {
+      std::string newID;
+      OFX::OfxPlugInfo info = generatePlugInfo(OFX::plugIDs[nth], newID);
+      OFX::plugInfoMap[newID] = std::move(info);
+      OFX::ofxPlugs[nth] = OFX::plugInfoMap.find(newID)->second._plug.get();
+    }
+    return OFX::ofxPlugs[nth];
   }
-  return OFX::ofxPlugs[nth];
+  catch (...) {
+    return nullptr;
+  }
 }
